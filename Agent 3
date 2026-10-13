@@ -1,0 +1,572 @@
+"""
+=============================================================
+  AGENT 3 — WEEKLY REPORT GENERATOR & ANALYST
+  Canadian Swing Trader | monday.com Multi-Agent System
+=============================================================
+  Reads outputs from Agent 1 (momentum) and Agent 2 (bounce)
+  via Google Sheets, synthesizes both datasets, and generates
+  a detailed weekly trade report using the Anthropic Claude API.
+
+  Data flow:
+    Google Sheets (A1 + A2) → Synthesizer → Claude API
+    → Weekly Report → Google Sheets + monday.com
+
+  Schedule: Run every Friday at 4:30pm ET
+            (or manually any time)
+
+  Dependencies:
+    pip install anthropic gspread google-auth python-dotenv requests
+
+  .env additions needed:
+    ANTHROPIC_API_KEY=your_anthropic_key_here
+    MONDAY_BOARD_ID_AGENT3=your_agent3_board_id_here
+=============================================================
+"""
+
+import os
+import json
+import logging
+import requests
+import anthropic
+
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from google.oauth2.service_account import Credentials
+import gspread
+
+# ─────────────────────────────────────────────
+#  CONFIG & ENVIRONMENT
+# ─────────────────────────────────────────────
+
+load_dotenv()
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY")
+MONDAY_API_KEY    = os.getenv("MONDAY_API_KEY")
+MONDAY_BOARD_ID   = os.getenv("MONDAY_BOARD_ID_AGENT3")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Trading Agent System")
+GOOGLE_CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "credentials.json")
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("agent3.log"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+#  STEP 1: READ DATA FROM GOOGLE SHEETS
+#  Pull this week's results from both Agent 1
+#  and Agent 2 sheets.
+# ─────────────────────────────────────────────
+
+def get_sheets_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds  = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def read_sheet_this_week(worksheet_name: str) -> list:
+    """
+    Read all rows from the given worksheet that were added this week.
+    Returns a list of dicts (one per row).
+    """
+    try:
+        client    = get_sheets_client()
+        book      = client.open(GOOGLE_SHEET_NAME)
+        sheet     = book.worksheet(worksheet_name)
+        all_rows  = sheet.get_all_records()  # Returns list of dicts using header row
+
+        # Filter to this week only (Monday to today)
+        today     = datetime.today()
+        week_start = today - timedelta(days=today.weekday())  # Monday
+        week_start = week_start.replace(hour=0, minute=0, second=0)
+
+        this_week = []
+        for row in all_rows:
+            try:
+                row_date = datetime.strptime(row.get("Date", ""), "%Y-%m-%d")
+                if row_date >= week_start:
+                    this_week.append(row)
+            except ValueError:
+                continue
+
+        log.info(f"Read {len(this_week)} rows from {worksheet_name} (this week)")
+        return this_week
+
+    except gspread.WorksheetNotFound:
+        log.warning(f"Worksheet '{worksheet_name}' not found — has Agent 1/2 run yet?")
+        return []
+    except Exception as e:
+        log.error(f"Failed to read {worksheet_name}: {e}")
+        return []
+
+
+def read_all_time_sheet(worksheet_name: str) -> list:
+    """
+    Read ALL rows from a sheet for historical win/loss tracking.
+    """
+    try:
+        client   = get_sheets_client()
+        book     = client.open(GOOGLE_SHEET_NAME)
+        sheet    = book.worksheet(worksheet_name)
+        return sheet.get_all_records()
+    except Exception as e:
+        log.warning(f"Could not read full history from {worksheet_name}: {e}")
+        return []
+
+
+# ─────────────────────────────────────────────
+#  STEP 2: FETCH MARKET CONTEXT
+#  Pull current market conditions to give
+#  Claude context for the report narrative.
+# ─────────────────────────────────────────────
+
+def fetch_market_context() -> dict:
+    """
+    Fetch current SPY, QQQ, and TSX composite performance
+    for macro context in the report.
+    """
+    context  = {}
+    tickers  = {
+        "SPY":  "S&P 500",
+        "QQQ":  "NASDAQ",
+        "X:XIU": "TSX (XIU)",
+    }
+
+    for ticker, label in tickers.items():
+        try:
+            end   = datetime.today().strftime("%Y-%m-%d")
+            start = (datetime.today() - timedelta(days=10)).strftime("%Y-%m-%d")
+            url   = (
+                f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day"
+                f"/{start}/{end}?adjusted=true&sort=asc&limit=10&apiKey={POLYGON_API_KEY}"
+            )
+            resp  = requests.get(url, timeout=10)
+            bars  = resp.json().get("results", [])
+
+            if len(bars) >= 2:
+                prev_close   = bars[-2]["c"]
+                latest_close = bars[-1]["c"]
+                week_ago     = bars[0]["c"]
+                daily_chg    = round((latest_close - prev_close) / prev_close * 100, 2)
+                weekly_chg   = round((latest_close - week_ago) / week_ago * 100, 2)
+                context[label] = {
+                    "price":      round(latest_close, 2),
+                    "daily_chg":  daily_chg,
+                    "weekly_chg": weekly_chg,
+                }
+        except Exception as e:
+            log.warning(f"Could not fetch market context for {ticker}: {e}")
+            context[label] = {"price": "N/A", "daily_chg": 0, "weekly_chg": 0}
+
+    return context
+
+
+def fetch_cad_usd_rate() -> float:
+    """Fetch current CAD/USD exchange rate from Polygon."""
+    try:
+        url  = f"https://api.polygon.io/v2/last/forex/CAD/USD?apiKey={POLYGON_API_KEY}"
+        resp = requests.get(url, timeout=10)
+        rate = resp.json().get("last", {}).get("ask", 0.74)
+        return round(rate, 4)
+    except Exception:
+        return 0.74  # Fallback approximate rate
+
+
+# ─────────────────────────────────────────────
+#  STEP 3: SYNTHESIZE — FIND OVERLAP TICKERS
+#  Tickers appearing in BOTH Agent 1 and Agent 2
+#  this week are the highest conviction setups.
+# ─────────────────────────────────────────────
+
+def find_overlap_tickers(momentum_data: list, bounce_data: list) -> list:
+    """
+    Find tickers that appear in both Agent 1 and Agent 2 results this week.
+    These are the highest conviction setups — oversold AND showing momentum.
+    """
+    momentum_tickers = set(row.get("Ticker", "") for row in momentum_data)
+    bounce_tickers   = set(row.get("Ticker", "") for row in bounce_data)
+    overlap          = momentum_tickers.intersection(bounce_tickers)
+
+    if overlap:
+        log.info(f"🔥 Overlap tickers found: {overlap}")
+    else:
+        log.info("No overlap tickers this week.")
+
+    return list(overlap)
+
+
+def get_top_picks(data: list, n: int = 5) -> list:
+    """Sort by Conviction Score and return top N picks."""
+    try:
+        sorted_data = sorted(
+            data,
+            key=lambda x: float(x.get("Conviction Score", 0)),
+            reverse=True
+        )
+        return sorted_data[:n]
+    except Exception:
+        return data[:n]
+
+
+# ─────────────────────────────────────────────
+#  STEP 4: CALCULATE PREVIOUS WEEK PERFORMANCE
+#  Basic win/loss tracking from the Trades log.
+# ─────────────────────────────────────────────
+
+def calculate_weekly_performance() -> dict:
+    """
+    Read the trade log sheet and calculate last week's win/loss stats.
+    Expects a sheet named 'Trade_Log' with columns:
+    Date, Ticker, Entry, Exit, PnL %, Result (Win/Loss)
+
+    If sheet doesn't exist yet, returns placeholder stats.
+    """
+    try:
+        client = get_sheets_client()
+        book   = client.open(GOOGLE_SHEET_NAME)
+        sheet  = book.worksheet("Trade_Log")
+        rows   = sheet.get_all_records()
+
+        # Filter last week
+        today      = datetime.today()
+        last_week_end   = today - timedelta(days=today.weekday() + 1)
+        last_week_start = last_week_end - timedelta(days=6)
+
+        last_week_trades = []
+        for row in rows:
+            try:
+                row_date = datetime.strptime(row.get("Date", ""), "%Y-%m-%d")
+                if last_week_start <= row_date <= last_week_end:
+                    last_week_trades.append(row)
+            except ValueError:
+                continue
+
+        if not last_week_trades:
+            return {"trades": 0, "winners": 0, "losers": 0, "win_rate": 0,
+                    "avg_win": 0, "avg_loss": 0, "notes": "No trades logged last week."}
+
+        winners  = [t for t in last_week_trades if t.get("Result") == "Win"]
+        losers   = [t for t in last_week_trades if t.get("Result") == "Loss"]
+        avg_win  = round(sum(float(t.get("PnL %", 0)) for t in winners) / len(winners), 2) if winners else 0
+        avg_loss = round(sum(float(t.get("PnL %", 0)) for t in losers)  / len(losers),  2) if losers  else 0
+        win_rate = round(len(winners) / len(last_week_trades) * 100, 1)
+
+        return {
+            "trades":   len(last_week_trades),
+            "winners":  len(winners),
+            "losers":   len(losers),
+            "win_rate": win_rate,
+            "avg_win":  avg_win,
+            "avg_loss": avg_loss,
+            "notes":    "Based on Trade_Log sheet.",
+        }
+
+    except gspread.WorksheetNotFound:
+        return {
+            "trades": 0, "winners": 0, "losers": 0, "win_rate": 0,
+            "avg_win": 0, "avg_loss": 0,
+            "notes": "Trade_Log sheet not set up yet — add it to track performance."
+        }
+    except Exception as e:
+        log.warning(f"Could not calculate performance: {e}")
+        return {"trades": 0, "winners": 0, "losers": 0, "win_rate": 0,
+                "avg_win": 0, "avg_loss": 0, "notes": str(e)}
+
+
+# ─────────────────────────────────────────────
+#  STEP 5: BUILD THE DATA PACKAGE FOR CLAUDE
+#  Assemble everything into a clean prompt
+#  that Claude will use to write the report.
+# ─────────────────────────────────────────────
+
+def build_claude_prompt(
+    momentum_top: list,
+    bounce_top: list,
+    overlap: list,
+    market_context: dict,
+    cad_usd: float,
+    performance: dict,
+    week_label: str,
+) -> str:
+    """
+    Build a detailed prompt for Claude to generate the weekly report narrative.
+    The more context we give Claude, the better the report.
+    """
+
+    momentum_str = json.dumps(momentum_top, indent=2) if momentum_top else "No momentum setups this week."
+    bounce_str   = json.dumps(bounce_top,   indent=2) if bounce_top   else "No bounce setups this week."
+    overlap_str  = ", ".join(overlap) if overlap else "None this week."
+
+    market_str = ""
+    for label, data in market_context.items():
+        market_str += (
+            f"  {label}: ${data['price']} | "
+            f"Daily: {data['daily_chg']}% | "
+            f"Weekly: {data['weekly_chg']}%\n"
+        )
+
+    prompt = f"""
+You are Agent 3 — the analyst for a Canadian swing trader's AI trading system.
+Your job is to synthesize the weekly scan results from two specialized agents
+and produce a clear, actionable weekly trade report.
+
+The trader is a Canadian swing trader focusing on 2-4 day holds across TSX
+and US-listed stocks. They are an independent trader using AI tools to augment
+their decision making.
+
+Today is {datetime.today().strftime("%A, %B %d, %Y")}.
+Report week: {week_label}
+CAD/USD rate: {cad_usd}
+
+━━━━ MARKET CONTEXT ━━━━
+{market_str}
+
+━━━━ AGENT 1 — TOP MOMENTUM SETUPS THIS WEEK ━━━━
+{momentum_str}
+
+━━━━ AGENT 2 — TOP BOUNCE-BACK SETUPS THIS WEEK ━━━━
+{bounce_str}
+
+━━━━ HIGH CONVICTION OVERLAP TICKERS ━━━━
+Tickers appearing in BOTH Agent 1 and Agent 2: {overlap_str}
+
+━━━━ PREVIOUS WEEK PERFORMANCE ━━━━
+Trades: {performance['trades']} | Winners: {performance['winners']} | Losers: {performance['losers']}
+Win Rate: {performance['win_rate']}% | Avg Win: {performance['avg_win']}% | Avg Loss: {performance['avg_loss']}%
+Notes: {performance['notes']}
+
+━━━━ YOUR TASK ━━━━
+Generate a complete weekly swing trade report using EXACTLY this structure:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEKLY SWING TRADE REPORT — {week_label}
+Canadian Swing Trader System | Powered by Agent 3
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SECTION 1 — EXECUTIVE SUMMARY
+[Write 3-4 sentences summarizing the week's opportunity landscape,
+market conditions, and overall bias. Be direct and actionable.]
+
+SECTION 2 — TOP MOMENTUM SETUPS (Agent 1)
+[Format as a ranked table. Include entry, stop, T1, T2, conviction, and
+a 1-line note on why each setup is interesting. Top 5 only.]
+
+SECTION 3 — TOP BOUNCE-BACK SETUPS (Agent 2)
+[Format as a ranked table. Include 5-day loss, RSI, drop cause, risk flag,
+support level, and a 1-line note. Top 5 only.]
+
+SECTION 4 — HIGH CONVICTION: OVERLAP TICKERS
+[If overlap tickers exist, explain why each one is compelling from BOTH
+a momentum AND bounce perspective. If none, note what to watch for instead.]
+
+SECTION 5 — RISK OVERVIEW
+[Cover: CAD/USD impact, broader market conditions, sectors to avoid,
+earnings risk names to skip, and recommended max position size.
+Be specific — not generic boilerplate.]
+
+SECTION 6 — PREVIOUS WEEK REVIEW
+[Summarize performance stats. Add a brief honest note on what the data
+suggests about the system's current edge.]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M ET")} | Next report: next Friday
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Write in a professional but direct tone — like a sharp trading desk analyst
+briefing a colleague. No fluff. Every sentence should be actionable.
+"""
+    return prompt.strip()
+
+
+# ─────────────────────────────────────────────
+#  STEP 6: CALL CLAUDE API TO WRITE THE REPORT
+# ─────────────────────────────────────────────
+
+def generate_report_with_claude(prompt: str) -> str:
+    """
+    Send the data package to Claude and get back the written report.
+    Uses the Anthropic Python SDK.
+    """
+    log.info("Sending data to Claude API to generate report...")
+
+    try:
+        client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        message = client.messages.create(
+            model      = "claude-opus-4-6",        # Best model for synthesis + writing
+            max_tokens = 4096,
+            messages   = [
+                {
+                    "role":    "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        report = message.content[0].text
+        log.info("✅ Claude generated the weekly report successfully.")
+        return report
+
+    except Exception as e:
+        log.error(f"Claude API call failed: {e}")
+        # Return a fallback plain report if API fails
+        return f"[Claude API unavailable — raw data below]\n\n{prompt}"
+
+
+# ─────────────────────────────────────────────
+#  STEP 7: SAVE REPORT TO GOOGLE SHEETS
+# ─────────────────────────────────────────────
+
+def save_report_to_sheets(report: str, week_label: str, summary: dict):
+    """
+    Save the generated report to the A3_Weekly_Reports sheet.
+    One row per week — stores the full report text plus key stats.
+    """
+    try:
+        client = get_sheets_client()
+        book   = client.open(GOOGLE_SHEET_NAME)
+
+        try:
+            sheet = book.worksheet("A3_Weekly_Reports")
+        except gspread.WorksheetNotFound:
+            sheet = book.add_worksheet("A3_Weekly_Reports", rows=500, cols=10)
+            sheet.append_row([
+                "Week", "Generated At",
+                "Momentum Setups", "Bounce Setups", "Overlap Tickers",
+                "Market Bias", "Full Report"
+            ])
+
+        sheet.append_row([
+            week_label,
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+            summary.get("momentum_count", 0),
+            summary.get("bounce_count", 0),
+            summary.get("overlap_count", 0),
+            summary.get("market_bias", "Neutral"),
+            report,
+        ])
+
+        log.info("✅ Report saved to Google Sheets (A3_Weekly_Reports).")
+
+    except Exception as e:
+        log.error(f"Failed to save report to Sheets: {e}")
+
+
+# ─────────────────────────────────────────────
+#  STEP 8: POST REPORT TO MONDAY.COM
+# ─────────────────────────────────────────────
+
+MONDAY_API_URL = "https://api.monday.com/v2"
+
+
+def post_report_to_monday(report: str, week_label: str, summary: dict):
+    """
+    Create a new item on the Agent 3 monday.com board with the weekly report.
+    """
+    # Truncate report for column value (monday has char limits)
+    report_preview = report[:2000] + "..." if len(report) > 2000 else report
+    report_preview = report_preview.replace('"', '\\"').replace("\n", "\\n")
+
+    col_values = {
+        "numbers_momentum":  str(summary.get("momentum_count", 0)),
+        "numbers_bounce":    str(summary.get("bounce_count", 0)),
+        "numbers_overlap":   str(summary.get("overlap_count", 0)),
+        "status_report":     {"label": "Ready"},
+        "status_bias":       {"label": summary.get("market_bias", "Neutral")},
+        "date_generated":    {"date": datetime.today().strftime("%Y-%m-%d")},
+        "long_text_report":  report_preview,
+    }
+
+    col_values_str = json.dumps(col_values).replace('"', '\\"')
+
+    query = f"""
+    mutation {{
+      create_item (
+        board_id: {MONDAY_BOARD_ID},
+        item_name: "Weekly Report — {week_label}",
+        column_values: "{col_values_str}"
+      ) {{
+        id
+      }}
+    }}
+    """
+
+    headers = {
+        "Authorization": MONDAY_API_KEY,
+        "Content-Type":  "application/json",
+        "API-Version":   "2024-01",
+    }
+
+    try:
+        resp = requests.post(
+            MONDAY_API_URL,
+            json={"query": query},
+            headers=headers,
+            timeout=10
+        )
+        data = resp.json()
+        if "errors" in data:
+            log.error(f"monday.com error: {data['errors']}")
+        else:
+            item_id = data["data"]["create_item"]["id"]
+            log.info(f"✅ Report posted to monday.com (ID: {item_id})")
+    except Exception as e:
+        log.error(f"monday.com post failed: {e}")
+
+
+def save_report_to_file(report: str, week_label: str):
+    """
+    Also save the report as a local .txt file for easy reading.
+    Creates a 'reports' subfolder in your project directory.
+    """
+    try:
+        os.makedirs("reports", exist_ok=True)
+        filename = f"reports/weekly_report_{week_label.replace(' ', '_')}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(report)
+        log.info(f"✅ Report saved locally to {filename}")
+    except Exception as e:
+        log.warning(f"Could not save report to file: {e}")
+
+
+# ─────────────────────────────────────────────
+#  STEP 9: MAIN RUNNER
+# ─────────────────────────────────────────────
+
+def run_report():
+    """
+    Main entry point for Agent 3.
+    Reads Agent 1 + Agent 2 data, synthesizes, and generates
+    the weekly report using Claude.
+    """
+    today      = datetime.today()
+    week_label = f"Week of {(today - timedelta(days=today.weekday())).strftime('%B %d, %Y')}"
+
+    log.info("=" * 55)
+    log.info("  AGENT 3 — WEEKLY REPORT GENERATOR STARTING")
+    log.info(f"  {today.strftime('%Y-%m-%d %H:%M:%S ET')}")
+    log.info(f"  {week_label}")
+    log.info("=" * 55)
+
+    # 1. Read this week's scan data from both agents
+    log.info("Reading Agent 1 data from Google Sheets...")
+    momentum_data = read_sheet_this_week("A1_Momentum_Scan")
+
+    log.info("Reading Agent 2 data from Google Sheets...")
+    bounce_data = read_sheet_this_week("A2_Bounce_Scan")
+
+    if not momentum_data and not bounce_data:
+        log.warning("No data found from either agent this week.")
+        log.warning("Make sure Agent 1 and Agent 2 have run at least once this week.")
+
+    # 2. Get top pick
